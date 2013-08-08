@@ -31,6 +31,8 @@ local LrProgressScope = import "LrProgressScope"
 local LrTasks = import "LrTasks"
 local LrFileUtils = import "LrFileUtils"
 
+local dummyString = "not a meatbag metadata" -- just be different to any possible real user metadata
+local pathPriorities = { {"Trash",-10} , {"memeNom", -20}, {"duplicate", -5}, {"sam_Image", 20} }  -- paths priority scores (higher is better). Default = 0
 require "Util"
 
 local function changeOrder(tree,photo)
@@ -44,13 +46,97 @@ local function changeOrder(tree,photo)
 	tree[1] = photo
 end
 
-local function markDuplicateEnv(settings, keyword)
+local function getNumberFromName(s) -- try to guess the photo number from the filename, like IGP12345, and avoid copy counters like MyCat(1), MyCat(2) ... MyCat(18)
+	local list = {}
+	s:gsub("(%d%d%d+)", function (x) if #list==0 or #x > #list[1] then list[1]=x end end) -- get the longest number of at least 3 digits
+	return list[1]
+end
+
+
+	
+local function growTupleMaker(tupleMaker, key, f) -- add function f as additional dimension to the tuple maker
+	return function(x)
+		keys, t = tupleMaker(x)
+		t[key]=f(x)
+		table.insert(keys,key)
+		return keys, t
+	end
+end
+
+local function mkTupleMaker(settings)
 	local iVC = settings.ignoreVirtualCopies
 	local uF = settings.useFlag
 	local pRaw = settings.preferRaw
+	if pRaw == true then
+		pRaw = { ["RAW"]=true, ["DNG"]=true}
+	end
 	local pL = settings.preferLarge
 	local pR = settings.preferRating
-	
+	local pP = pathPriorities
+	local tupleMaker = nil
+	local grow = growTupleMaker
+	if uF then
+		tupleMaker = function(x) return {}, {} end
+		-- deal with raw preference
+		if pRaw then
+			tupleMaker = grow(tupleMaker, "fileformat", function(photo) return pRaw[photo:getRawMetadata("fileFormat")] end)
+		end
+		-- deal with file size
+		if pL then
+			local function getMP(p) -- get MegaPixels count from photo
+				local l = {}
+				p:getFormattedMetadata("dimensions"):gsub("(%d+)%s*x%s*(%d+)", function (x,y) table.insert(l,x*y*1e-6) end)
+				return l[1]
+			end
+			tupleMaker = grow(tupleMaker, "MPixels", getMP)
+			tupleMaker = grow(tupleMaker, "fileSize", function(photo) return photo:getRawMetadata("fileSize") end)
+		end
+		-- deal with paths priority
+		if pP then
+			local function pathPrio(photo)
+				local path =   photo:getRawMetadata("path")
+				local prio = 0
+				for i, v in ipairs(pP) do
+					pattern = v[1]
+					if path:find(pattern) then
+						prio = v[2]
+					end
+				end
+				return prio
+			end
+			tupleMaker = grow(tupleMaker, "pathPriority", pathPrio)
+		end
+		-- deal with rating
+		if pR then
+			tupleMaker = grow(tupleMaker, "rating", function(photo) return photo:getRawMetadata("rating") end)
+		end
+		-- deal with virtual copies
+		if not iVC then
+			tupleMaker = grow(tupleMaker, "isVirtualCopy", function(photo) return not photo:getRawMetadata("isVirtualCopy") end)
+		end
+	end
+	return tupleMaker
+end
+local function markDuplicateEnv(tupleMaker, keyword)	
+	local function lexComp(keys, x, y) -- lexicographical compare. Return value like the sign of (x-y)
+		local function val(x)
+			if not x then
+				return 0
+			elseif type(x)=="boolean" then
+				return 1
+			else 
+				return x
+			end
+		end
+		for i,k in ipairs(keys) do
+			if val(x[k]) < val(y[k]) then
+				return -1
+			elseif val(y[k]) < val(x[k]) then
+				return 1
+			end
+		end
+		return 0
+	end
 	return function(tree, photo)
 		if #tree == 0 then
 			-- this is easy. just add the photo to the empty list
@@ -64,44 +150,12 @@ local function markDuplicateEnv(settings, keyword)
 			if #tree == 1 then
 				tree[1]:addKeyword(keyword)
 			end
-			if uF then
-				-- deal with raw preference
-				if pRaw then
-					if tree[1]:getRawMetadata("fileFormat") ~= "RAW" then
-						if photo:getRawMetadata("fileFormat") == "RAW" then
-							changeOrder(tree,photo)
-							return true
-						end
-					end
-				end
-				-- deal with file size
-				if pL then
-					local sizeHead = tree[1]:getRawMetadata("fileSize")
-					local sizeNew = photo:getRawMetadata("fileSize")
-					if sizeNew > sizeHead then
-						changeOrder(tree,photo)
-						return true
-					end
-				end
-				-- deal with rating
-				if pR then
-					local ratingHead = tree[1]:getRawMetadata("rating")
-					local ratingNew = photo:getRawMetadata("rating")
-					if ratingHead == nil then ratingHead = 0 end
-					if ratingNew == nil then ratingNew = 0 end
-					if ratingNew > ratingHead then
-						changeOrder(tree,photo)
-						return true
-					end
-				end
-				-- deal with virtual copies
-				if not iVC then
-					if tree[1]:getRawMetadata("isVirtualCopy") then
-						if not photo:getRawMetadata("isVirtualCopy") then
-							changeOrder(tree,photo)
-							return true
-						end
-					end
+			if tupleMaker then
+				keys, t1 = tupleMaker(tree[1])
+				keys, t2 = tupleMaker(photo)
+				if lexComp(keys, t1, t2) < 0 then
+					changeOrder(tree, photo)
+					return true
 				end
 				-- set the flag
 				photo:setRawMetadata("pickStatus", -1)
@@ -136,8 +190,7 @@ local function getExifToolData(settings)
 				logger:debug("getExifToolData error for : " .. cmdLine)
 			end
 		end
-		-- nil is not a valid key, thus, we take a dummy value
-    	if not value then value = "123exifTool456" end
+    	if not value then value = dummyString end
     	return value
 	end
 end
@@ -173,11 +226,24 @@ local function exifToolEnv(exifTool, marker)
 	end
 end
 
-local function comperatorEnv(name, comp)
+local uniqueID=0
+local function mkUniqueID() 
+	return function(p)
+				uniqueID = uniqueID + 1
+				return dummyString .. tostring(uniqueID)
+			end
+end
+
+local function mkComparatorEnv(functor, fallbackF, comp)
 	return function(tree, photo)
-		local value = photo:getFormattedMetadata(name)
-		-- nil is not a valid key, thus, we take a dummy value
-    	if not value then value = "123" .. name .. "456" end
+		local value = functor(photo)
+    	if not value then 
+			if fallbackF then 
+				value = fallbackF(photo)
+			else
+				value = dummyString
+			end
+		end
     	-- does the entry already exists?
     	local sub = tree[value]
 		if not sub then
@@ -188,6 +254,113 @@ local function comperatorEnv(name, comp)
 	end
 end
 
+local function mkComparatorChain(settings, act)
+	  	if settings.useExifTool then
+	  		act = exifToolEnv(getExifToolData(settings), act)
+	  		if doLog then
+				logger:debug("findDuplicates: using exifTool")
+			end
+	  	end
+	  	if settings.useCaptureDate then
+			local function timeFallback(photo) 
+				local val = photo:getFormattedMetadata("dateTimeDigitized")
+				if val then return val else return mkUniqueID()(photo) end
+			end
+			act = mkComparatorEnv( function(p) return p:getFormattedMetadata("dateTimeOriginal")  end, timeFallback, act)
+			if doLog then
+				logger:debug("findDuplicates: using dateTimeOriginal")
+			end
+		end
+		if true then
+			getFilename = function(p) return p:getFormattedMetadata("fileName") end
+			act = mkComparatorEnv( function(p) return getNumberFromName(getFilename(p))  end, getFilename, act)
+			if doLog then
+				logger:debug("findDuplicates: using fileNameNumber")
+			end
+		end
+		if settings.useGPSAltitude then
+			act = mkComparatorEnv( function(p) return p:getFormattedMetadata("gpsAltitude")  end, nil, act)
+			if doLog then
+				logger:debug("findDuplicates: using gpsAltitude")
+			end
+		end
+		if settings.useGPS then
+			act = mkComparatorEnv( function(p) return p:getFormattedMetadata("gps")  end, nil, act)
+			if doLog then
+				logger:debug("findDuplicates: using gps")
+			end
+		end
+		if settings.useExposureBias then
+			act = mkComparatorEnv( function(p) return p:getFormattedMetadata("exposureBias")  end, nil, act)
+			if doLog then
+				logger:debug("findDuplicates: using exposureBias")
+			end
+		end
+		if settings.useAperture then
+			act = mkComparatorEnv( function(p) return p:getFormattedMetadata("aperture")  end, nil, act)
+			if doLog then
+				logger:debug("findDuplicates: using aperture")
+			end
+		end
+		if settings.useShutterSpeed then
+			act = mkComparatorEnv( function(p) return p:getFormattedMetadata("shutterSpeed")  end, nil, act)
+			if doLog then
+				logger:debug("findDuplicates: using shutterSpeed")
+			end
+		end
+		if settings.useIsoRating then
+			act = mkComparatorEnv( function(p) return p:getFormattedMetadata("isoSpeedRating")  end, nil, act)
+			if doLog then
+				logger:debug("findDuplicates: using isoSpeedRating")
+			end
+		end
+		if settings.useLens then
+			act = mkComparatorEnv( function(p) return p:getFormattedMetadata("lens")  end, nil, act)
+			if doLog then
+				logger:debug("findDuplicates: using lens")
+			end
+		end
+		if settings.useSerialNumber then
+			act = mkComparatorEnv( function(p) return p:getFormattedMetadata("cameraSerialNumber")  end, nil, act)
+			if doLog then
+				logger:debug("findDuplicates: using cameraSerialNumber")
+			end
+		end
+		if settings.useModel then
+			act = mkComparatorEnv( function(p) return p:getFormattedMetadata("cameraModel")  end, nil, act)
+			if doLog then
+				logger:debug("findDuplicates: using cameraModel")
+			end
+		end
+		if settings.useMake then
+			act = mkComparatorEnv( function(p) return p:getFormattedMetadata("cameraMake")  end, nil, act)
+			if doLog then
+				logger:debug("findDuplicates: using exposureBias")
+			end
+		end
+		
+		if settings.useFileName then
+			act = mkComparatorEnv( function(p) return p:getFormattedMetadata("fileName")  end, nil, act)
+			if doLog then
+				logger:debug("findDuplicates: using fileName")
+			end
+		end
+		
+		if settings.useFileSize then
+			act = mkComparatorEnv( function(p) return p:getFormattedMetadata("fileSize")  end, nil, act)
+			if doLog then
+				logger:debug("findDuplicates: using fileSize")
+			end
+		end
+		
+		if settings.useFileType then
+			act = mkComparatorEnv( function(p) return p:getFormattedMetadata("fileType")  end, nil, act)
+			if doLog then
+				logger:debug("findDuplicates: using fileType")
+			end
+		end
+	return act
+end
 
 function Teekesselchen.new(context)
 	local self = {}
@@ -297,101 +470,12 @@ function Teekesselchen.new(context)
 				end			
 			end)
 	  	end
+		-- build the tupleMaker chain (used to order duplicates to pick best / reject the rest)
+		local tupleMaker = mkTupleMaker(settings)
+		
 	  	-- build the comparator chain
-	  	local act = markDuplicateEnv(settings, keywordObj)
-	  	if settings.useExifTool then
-	  		act = exifToolEnv(getExifToolData(settings), act)
-	  		if doLog then
-				logger:debug("findDuplicates: using exifTool")
-			end
-	  	end
-	  	if settings.useCaptureDate then
-			act = comperatorEnv("dateTimeOriginal", act)
-			if doLog then
-				logger:debug("findDuplicates: using dateTimeOriginal")
-			end
-		end
-		if settings.useGPSAltitude then
-			act = comperatorEnv("gpsAltitude", act)
-			if doLog then
-				logger:debug("findDuplicates: using gpsAltitude")
-			end
-		end
-		if settings.useGPS then
-			act = comperatorEnv("gps", act)
-			if doLog then
-				logger:debug("findDuplicates: using gps")
-			end
-		end
-		if settings.useExposureBias then
-			act = comperatorEnv("exposureBias", act)
-			if doLog then
-				logger:debug("findDuplicates: using exposureBias")
-			end
-		end
-		if settings.useAperture then
-			act = comperatorEnv("aperture", act)
-			if doLog then
-				logger:debug("findDuplicates: using aperture")
-			end
-		end
-		if settings.useShutterSpeed then
-			act = comperatorEnv("shutterSpeed", act)
-			if doLog then
-				logger:debug("findDuplicates: using shutterSpeed")
-			end
-		end
-		if settings.useIsoRating then
-			act = comperatorEnv("isoSpeedRating", act)
-			if doLog then
-				logger:debug("findDuplicates: using isoSpeedRating")
-			end
-		end
-		if settings.useLens then
-			act = comperatorEnv("lens", act)
-			if doLog then
-				logger:debug("findDuplicates: using lens")
-			end
-		end
-		if settings.useSerialNumber then
-			act = comperatorEnv("cameraSerialNumber", act)
-			if doLog then
-				logger:debug("findDuplicates: using cameraSerialNumber")
-			end
-		end
-		if settings.useModel then
-			act = comperatorEnv("cameraModel", act)
-			if doLog then
-				logger:debug("findDuplicates: using cameraModel")
-			end
-		end
-		if settings.useMake then
-			act = comperatorEnv("cameraMake", act)
-			if doLog then
-				logger:debug("findDuplicates: using exposureBias")
-			end
-		end
-		
-		if settings.useFileName then
-			act = comperatorEnv("fileName", act)
-			if doLog then
-				logger:debug("findDuplicates: using fileName")
-			end
-		end
-		
-		if settings.useFileSize then
-			act = comperatorEnv("fileSize", act)
-			if doLog then
-				logger:debug("findDuplicates: using fileSize")
-			end
-		end
-		
-		if settings.useFileType then
-			act = comperatorEnv("fileType", act)
-			if doLog then
-				logger:debug("findDuplicates: using fileType")
-			end
-		end
+	  	local act = markDuplicateEnv(tupleMaker, keywordObj)
+		act = mkComparatorChain(settings, act)
   	
   		-- provide a keyword object in current settings
   	
@@ -452,6 +536,9 @@ function Teekesselchen.new(context)
 					duplicateCounter = duplicateCounter + 1
 				end
 			end
+		end
+		if doLog then
+				logger:debug("findDuplicates: " .. tostring(nbDateLessFiles) .. "dateless files found")
 		end
 	end)
 		progressScope:done()
