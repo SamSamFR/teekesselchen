@@ -68,7 +68,7 @@ local function mkTupleMaker(settings)
 	local uF = settings.useFlag
 	local pRaw = settings.preferRaw
 	if pRaw == true then
-		pRaw = { ["RAW"]=true, ["DNG"]=true}
+		pRaw = { ["RAW"]=2, ["DNG"]=1} -- both might be RAW
 	end
 	local pL = settings.preferLarge
 	local pR = settings.preferRating
